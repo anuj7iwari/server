@@ -2,16 +2,15 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 import base64
-import io
-from PIL import Image
 import pytesseract
+import cv2
+import numpy as np
 
 app = FastAPI()
 
-# IMPORTANT: Allow your Chrome Extension to communicate with this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, you can restrict this to the VTOP domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -23,28 +22,41 @@ class CaptchaRequest(BaseModel):
 @app.post("/solve")
 def solve_captcha(request: CaptchaRequest):
     try:
-        # 1. Clean the base64 string (remove the "data:image/jpeg;base64," part if sent by the extension)
         b64_string = request.base64_image
         if "," in b64_string:
             b64_string = b64_string.split(",")[1]
 
-        # 2. Decode base64 to image bytes
+        # 1. Convert base64 straight into an OpenCV image (numpy array)
         image_data = base64.b64decode(b64_string)
-        image = Image.open(io.BytesIO(image_data))
+        nparr = np.frombuffer(image_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        # 3. Pre-process the image for better OCR accuracy (Grayscale & Thresholding)
-        image = image.convert('L') # Convert to grayscale
-        # Apply a threshold to make the text bold black and background white
-        threshold = 150
-        image = image.point(lambda p: 255 if p > threshold else 0)
+        if img is None:
+            raise ValueError("Invalid image data")
 
-        # 4. Run OCR (VTOP captchas are usually 6 characters, uppercase and numbers)
-        # psm 8 assumes a single word/line. Whitelist ensures no special characters are guessed.
+        # 2. Resize image (make it 2x larger) - Tesseract loves big text
+        img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+        # 3. Convert to Grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 4. Apply a Median Blur to remove background dots/noise
+        blur = cv2.medianBlur(gray, 3)
+
+        # 5. Apply Otsu's Thresholding (Automatically finds the best black/white contrast)
+        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # 6. Run OCR
+        # psm 8 = single word. Whitelist limits guesses to only valid VTOP characters.
         custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        text = pytesseract.image_to_string(image, config=custom_config)
+        text = pytesseract.image_to_string(thresh, config=custom_config)
         
-        # Clean up whitespace
+        # Clean up the final text (VTOP captchas are 6 characters)
         text = text.strip().replace(" ", "")
+        
+        # Optional: Force it to exactly 6 characters if it guessed extra noise
+        if len(text) > 6:
+            text = text[:6]
 
         return {"status": "success", "captcha": text}
 
@@ -53,4 +65,4 @@ def solve_captcha(request: CaptchaRequest):
 
 @app.get("/")
 def home():
-    return {"message": "Captcha Solver API is running!"}
+    return {"message": "Advanced Captcha Solver API is running!"}

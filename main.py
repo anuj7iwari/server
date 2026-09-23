@@ -1,13 +1,21 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
+import os
 import base64
-import pytesseract
-import cv2
 import numpy as np
+import cv2
+import pytesseract
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-app = FastAPI()
+# Set Windows local Tesseract binary path if running directly on Windows
+if os.name == "nt":
+    default_win_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.exists(default_win_path):
+        pytesseract.pytesseract.tesseract_cmd = default_win_path
 
+app = FastAPI(title="VTOP Captcha Solver API")
+
+# Enable Cross-Origin Resource Sharing for Chrome extension calls
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,50 +27,68 @@ app.add_middleware(
 class CaptchaRequest(BaseModel):
     base64_image: str
 
-@app.post("/solve")
-def solve_captcha(request: CaptchaRequest):
-    try:
-        b64_string = request.base64_image
-        if "," in b64_string:
-            b64_string = b64_string.split(",")[1]
-
-        # 1. Convert base64 straight into an OpenCV image (numpy array)
-        image_data = base64.b64decode(b64_string)
-        nparr = np.frombuffer(image_data, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-
-        if img is None:
-            raise ValueError("Invalid image data")
-
-        # 2. Resize image (make it 2x larger) - Tesseract loves big text
-        img = cv2.resize(img, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-
-        # 3. Convert to Grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-        # 4. Apply a Median Blur to remove background dots/noise
-        blur = cv2.medianBlur(gray, 3)
-
-        # 5. Apply Otsu's Thresholding (Automatically finds the best black/white contrast)
-        _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        # 6. Run OCR
-        # psm 8 = single word. Whitelist limits guesses to only valid VTOP characters.
-        custom_config = r'--oem 3 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-        text = pytesseract.image_to_string(thresh, config=custom_config)
-        
-        # Clean up the final text (VTOP captchas are 6 characters)
-        text = text.strip().replace(" ", "")
-        
-        # Optional: Force it to exactly 6 characters if it guessed extra noise
-        if len(text) > 6:
-            text = text[:6]
-
-        return {"status": "success", "captcha": text}
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+def extract_text(image_np: np.ndarray, psm_mode: int) -> str:
+    """Helper to run OCR with full alphanumeric matching and forced uppercase conversion."""
+    config = (
+        f"--oem 3 --psm {psm_mode} "
+        r"-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    )
+    raw = pytesseract.image_to_string(image_np, config=config)
+    cleaned = "".join(raw.split()).strip().upper()
+    return cleaned
 
 @app.get("/")
-def home():
-    return {"message": "Advanced Captcha Solver API is running!"}
+def health_check():
+    return {"status": "online", "service": "VTOP Captcha Solver"}
+
+@app.post("/solve")
+def solve_captcha(payload: CaptchaRequest):
+    try:
+        raw_b64 = payload.base64_image
+        if "," in raw_b64:
+            raw_b64 = raw_b64.split(",")[1]
+
+        image_bytes = base64.b64decode(raw_b64)
+        np_arr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+        if img is None:
+            raise ValueError("Failed to decode image data.")
+
+        # 1. Upscale image 3x to expand letter separation and line thickness
+        scaled = cv2.resize(img, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+
+        # 2. Convert to grayscale
+        gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
+
+        # 3. Bilateral filter preserves character boundaries while removing noise
+        denoised = cv2.bilateralFilter(gray, d=9, sigmaColor=75, sigmaSpace=75)
+
+        # 4. Otsu's binary thresholding (dark text on white canvas)
+        _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # 5. Morphological erosion to break thin connections between touching letters
+        kernel = np.ones((2, 2), np.uint8)
+        processed = cv2.erode(thresh, kernel, iterations=1)
+
+        # Pass 1: Try single-line recognition (PSM 7)
+        result = extract_text(processed, psm_mode=7)
+
+        # Pass 2: Fallback to single-word (PSM 8) or un-eroded threshold if empty or malformed
+        if len(result) < 4:
+            alt_result = extract_text(thresh, psm_mode=8)
+            if len(alt_result) > len(result):
+                result = alt_result
+
+        # Truncate to standard VTOP 6-character length if stray symbols were captured
+        if len(result) > 6:
+            result = result[:6]
+
+        return {"status": "success", "captcha": result}
+
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
